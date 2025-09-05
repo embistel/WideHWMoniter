@@ -65,7 +65,21 @@ def get_ram_usage():
     total_gb = mem_info.total / (1024**3)
     return percent, used_gb, total_gb
 
+def get_disk_info(drive_letter):
+    """지정된 드라이브의 디스크 정보를 반환합니다. (퍼센트, 사용량 GB, 총량 GB)"""
+    try:
+        usage = psutil.disk_usage(f'{drive_letter}:\\')
+        return {
+            'percent': usage.percent,
+            'used_gb': usage.used / (1024**3),
+            'total_gb': usage.total / (1024**3)
+        }
+    except FileNotFoundError:
+        return None
+
+
 def get_network_speed_mbps():
+
     """가장 활성화된 네트워크 인터페이스의 링크 속도를 Mbps 단위로 가져옵니다."""
     try:
         stats = psutil.net_if_stats()
@@ -228,6 +242,76 @@ def draw_core_grid(draw_list, top_left, size, core_usages):
             rounding=3.0
         )
 
+def draw_disk_gauge(draw_list, center, radius, usage_percent, read_percent, write_percent, label, read_speed_mbps, write_speed_mbps, sub_text=None):
+    """디스크 사용량, 읽기/쓰기 속도를 표시하는 게이지를 그립니다."""
+    background_thickness = 8
+    foreground_thickness = 12
+
+    # R/W activity color
+    color_percent = (read_percent + write_percent) / 2.0
+    r, g, b, a = get_gradient_color(color_percent)
+    main_color = imgui.get_color_u32_rgba(r, g, b, a)
+
+    # Gauge background
+    draw_list.add_circle(center.x, center.y, radius, imgui.get_color_u32_rgba(0.2, 0.2, 0.2, 1.0), num_segments=128, thickness=background_thickness)
+
+    # Write speed arc (left)
+    if write_percent > 0:
+        angle_end_write = -math.pi / 2
+        angle_start_write = angle_end_write - (min(write_percent, 100) / 100.0) * math.pi
+        num_segments = int(64 * min(write_percent, 100) / 100)
+        if num_segments < 2: num_segments = 2
+        draw_list.path_clear()
+        draw_list.path_arc_to(center.x, center.y, radius, angle_start_write, angle_end_write, num_segments=num_segments)
+        draw_list.path_stroke(main_color, thickness=foreground_thickness)
+
+    # Read speed arc (right)
+    if read_percent > 0:
+        angle_start_read = -math.pi / 2
+        angle_end_read = angle_start_read + (min(read_percent, 100) / 100.0) * math.pi
+        num_segments = int(64 * min(read_percent, 100) / 100)
+        if num_segments < 2: num_segments = 2
+        draw_list.path_clear()
+        draw_list.path_arc_to(center.x, center.y, radius, angle_start_read, angle_end_read, num_segments=num_segments)
+        draw_list.path_stroke(main_color, thickness=foreground_thickness)
+
+    # Inner filled circle for usage
+    if usage_percent > 0:
+        inner_color = get_gradient_color(usage_percent)
+        main_inner_color = imgui.get_color_u32_rgba(inner_color[0], inner_color[1], inner_color[2], 0.6)
+        inner_radius = radius * (usage_percent / 100.0)
+        draw_list.add_circle_filled(center.x, center.y, inner_radius, main_inner_color, num_segments=128)
+
+    # R/W speed text in the center
+    read_text = f"R: {read_speed_mbps:.1f}"
+    write_text = f"W: {write_speed_mbps:.1f}"
+
+    read_text_size = imgui.calc_text_size(read_text)
+    write_text_size = imgui.calc_text_size(write_text)
+
+    text_padding = 5
+    total_height = read_text_size.y + write_text_size.y + text_padding
+    
+    read_pos_y = center.y - total_height / 2
+    write_pos_y = read_pos_y + read_text_size.y + text_padding
+
+    read_pos_x = center.x - read_text_size.x / 2
+    write_pos_x = center.x - write_text_size.x / 2
+
+    draw_list.add_text(read_pos_x, read_pos_y, imgui.get_color_u32_rgba(1, 1, 1, 1), read_text)
+    draw_list.add_text(write_pos_x, write_pos_y, imgui.get_color_u32_rgba(1, 1, 1, 1), write_text)
+
+    # Label below gauge
+    label_size = imgui.calc_text_size(label)
+    label_pos = imgui.Vec2(center.x - label_size.x / 2, center.y + radius + 15)
+    draw_list.add_text(label_pos.x, label_pos.y, imgui.get_color_u32_rgba(0.8, 0.8, 0.8, 1), label)
+
+    # Sub-text for total disk space
+    if sub_text:
+        sub_text_size = imgui.calc_text_size(sub_text)
+        sub_text_pos = imgui.Vec2(center.x - sub_text_size.x / 2, label_pos.y + label_size.y + 5)
+        draw_list.add_text(sub_text_pos.x, sub_text_pos.y, imgui.get_color_u32_rgba(0.7, 0.7, 0.7, 1), sub_text)
+
 def main():
     if not glfw.init():
         print("GLFW를 초기화할 수 없습니다.", file=sys.stderr)
@@ -295,6 +379,10 @@ def main():
     last_net_io = psutil.net_io_counters()
     last_net_time = time.time()
 
+    last_disk_io = psutil.disk_io_counters()
+    last_disk_time = time.time()
+    max_disk_rw_mbps = 1000  # 1GB/s
+
     while not glfw.window_should_close(window):
         frame_start_time = time.time()
 
@@ -334,6 +422,27 @@ def main():
         upload_percent = (upload_speed_mbps / max_upload_mbps) * 100 if max_upload_mbps > 0 else 0
         download_percent = (download_speed_mbps / max_download_mbps) * 100 if max_download_mbps > 0 else 0
 
+        current_disk_time = time.time()
+        current_disk_io = psutil.disk_io_counters()
+        disk_time_delta = current_disk_time - last_disk_time
+
+        if disk_time_delta > 0:
+            bytes_read = current_disk_io.read_bytes - last_disk_io.read_bytes
+            bytes_written = current_disk_io.write_bytes - last_disk_io.write_bytes
+            read_speed_mbps = (bytes_read / disk_time_delta) / (1024**2)
+            write_speed_mbps = (bytes_written / disk_time_delta) / (1024**2)
+        else:
+            read_speed_mbps = 0
+            write_speed_mbps = 0
+        
+        last_disk_io = current_disk_io
+        last_disk_time = current_disk_time
+
+        read_percent = (read_speed_mbps / max_disk_rw_mbps) * 100
+        write_percent = (write_speed_mbps / max_disk_rw_mbps) * 100
+
+        disk_info_c = get_disk_info('C')
+
         # --- 그리기 ---
         draw_list = imgui.get_window_draw_list()
         
@@ -345,14 +454,15 @@ def main():
         cpu_total_width = (gauge_radius * 2) + cpu_grid_width
         regular_gauge_width = gauge_radius * 2
         
-        # Spacing calculation for 3 items
-        total_content_width = cpu_total_width + (regular_gauge_width * 2)
-        spacing = (width - total_content_width) / 4 # 3 items, 4 gaps
+        # Spacing calculation for 4 items
+        total_content_width = cpu_total_width + (regular_gauge_width * 3)
+        spacing = (width - total_content_width) / 5 # 4 items, 5 gaps
 
         # Positions
         pos1_x = spacing + cpu_total_width / 2
         pos2_x = pos1_x + cpu_total_width / 2 + spacing + regular_gauge_width / 2
         pos3_x = pos2_x + regular_gauge_width / 2 + spacing + regular_gauge_width / 2
+        pos4_x = pos3_x + regular_gauge_width / 2 + spacing + regular_gauge_width / 2
 
         # 1. CPU / RAM
         cpu_ram_center_x = pos1_x - cpu_grid_width / 2
@@ -368,6 +478,21 @@ def main():
 
         # 3. Network
         draw_network_gauge(draw_list, imgui.Vec2(pos3_x, center_y), gauge_radius, upload_percent, download_percent, "Network", upload_speed_mbps, download_speed_mbps)
+
+        # 4. Disk C:
+        if disk_info_c:
+            draw_disk_gauge(
+                draw_list,
+                imgui.Vec2(pos4_x, center_y),
+                gauge_radius,
+                disk_info_c['percent'],
+                read_percent,
+                write_percent,
+                "Disk (C:)",
+                read_speed_mbps,
+                write_speed_mbps,
+                f"{disk_info_c['used_gb']:.1f}/{disk_info_c['total_gb']:.1f} GB"
+            )
 
         imgui.end()
 
